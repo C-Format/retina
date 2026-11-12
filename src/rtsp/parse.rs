@@ -181,6 +181,7 @@ impl ParserBuilder {
             max_message_size: self.max_message_size,
             state: ParserState::default(),
             stream_pos: 0,
+            msg_start_pos: 0,
         }
     }
 }
@@ -190,6 +191,8 @@ pub struct Parser {
     state: ParserState,
     /// Cumulative bytes consumed from the stream across all `feed` calls.
     stream_pos: u64,
+    /// See [`Parser::msg_start_pos`].
+    msg_start_pos: u64,
 }
 
 impl Default for Parser {
@@ -230,6 +233,15 @@ impl Parser {
         self.stream_pos
     }
 
+    /// Stream position where the current message begins (its `$` or the first byte of its start
+    /// line), past any blank lines before it, however many `feed` calls it has taken so far.
+    ///
+    /// After `feed` returns a message, that message. After `Incomplete` or an error, the message in
+    /// progress. After `Ok(None)`, where the next message will begin.
+    pub fn msg_start_pos(&self) -> u64 {
+        self.msg_start_pos
+    }
+
     /// Returns an error if a request or response of at least `size` bytes
     /// exceeds the configured maximum.
     fn check_size(&self, msg: &Message, size: u64) -> Result<(), FeedError> {
@@ -247,11 +259,15 @@ impl Parser {
     /// Parses the next message from `input`.
     ///
     /// Returns `Ok(Some(...))` when a complete message has been parsed.
-    /// Returns `Ok(None)` when idle with no input bytes available; the caller
-    /// decides whether this is clean EOF or "need more data".
+    /// Returns `Ok(None)` when idle between messages with no more input: no
+    /// partial message is held, though blank lines between messages may have
+    /// been consumed. The caller decides whether this is a clean EOF or "need
+    /// more data".
     /// On `Err(Incomplete(_))`, the caller should supply more bytes and call
-    /// again; `input` reflects any bytes that were stably consumed (so the
-    /// caller can advance its buffer accordingly).
+    /// again.
+    /// On both `Ok(None)` and `Err(Incomplete(_))`, `input` reflects the bytes
+    /// that were stably consumed, and the caller should advance its buffer past
+    /// them.
     /// On `Err(Invalid)`, the connection is unrecoverable; [`Invalid::pos`]
     /// gives the stream offset where the error was detected.
     pub fn feed<'i, I: Input<'i>>(
@@ -260,7 +276,7 @@ impl Parser {
     ) -> Result<Option<(Message, I)>, FeedError> {
         let start_pos = self.stream_pos;
         let initial_len = input.len();
-        let result = self.feed_inner(input);
+        let result = self.feed_inner(input, start_pos, initial_len);
         let consumed = (initial_len - input.len()) as u64;
         self.stream_pos += consumed;
         result.map_err(|e| e.with_pos(start_pos + consumed))
@@ -269,10 +285,22 @@ impl Parser {
     fn feed_inner<'i, I: Input<'i>>(
         &mut self,
         input: &mut I,
+        start_pos: u64,
+        initial_len: usize,
     ) -> Result<Option<(Message, I)>, FeedError> {
         loop {
             match std::mem::take(&mut self.state) {
                 ParserState::Idle => {
+                    // Blank lines between messages belong to no message: step over them so the
+                    // next message's start is its own first byte. A lone `\r` or a `\r` not
+                    // followed by `\n` is left for `parse_head` to judge.
+                    while input.len() >= 2
+                        && input.peek_byte() == Some(b'\r')
+                        && input.byte_at(1) == b'\n'
+                    {
+                        input.advance(2);
+                    }
+                    self.msg_start_pos = start_pos + (initial_len - input.len()) as u64;
                     let checkpoint = *input;
                     let before = input.len();
                     // An interleaved frame written into the first line of a
@@ -480,11 +508,10 @@ impl Parser {
     }
 }
 
-/// Skips any leading CRLFs, then parses the first line of the next message.
+/// Parses the first line of the next message.
 /// Returns `Ok(None)` when the input is empty (caller decides if that's
 /// clean EOF or needs more data).
 fn parse_head<'i, I: Input<'i>>(input: &mut I) -> Result<Option<Message>, FeedError> {
-    skip_crlfs(input)?;
     match input.peek_byte() {
         None => Ok(None),
         Some(b'$') => {
@@ -832,8 +859,8 @@ pub(crate) mod tests {
     ) -> Result<Option<(Message, Split<'a>)>, FeedError> {
         let mut p1 = Split::new(first, &[]);
         match parser.feed(&mut p1) {
-            // Ok(None) means idle with no data (first was empty) or
-            // Incomplete means parser needs more — either way, feed the rest.
+            // Ok(None) means idle between messages (possibly after consuming blank lines) and
+            // Incomplete means the parser needs more; either way, feed the rest.
             Ok(None) | Err(FeedError::Incomplete(_)) => {
                 let consumed = first.len() - p1.len();
                 let mut p2 = Split::new(&first[consumed..], second);
@@ -1320,5 +1347,47 @@ pub(crate) mod tests {
             FeedError::Incomplete(inc) => assert!(inc.needed.is_none()),
             other => panic!("expected Incomplete with needed=None, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_blank_line_at_the_end_of_a_read_is_consumed_once() {
+        // A caller that, like the connection, advances its buffer by whatever `feed` consumed. A
+        // read ending in the blank line some servers send between messages consumes it once; the
+        // next read does not scan it again, so the stream position does not drift.
+        let mut p = Parser::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut delivered = 0;
+        let mut f = vec![b'$', 0, 0, 40, 0x80, 0x60];
+        f.resize(44, 0xab);
+        for read in [&b"\r\n"[..], &f[..]] {
+            buf.extend_from_slice(read);
+            loop {
+                let mut input: &[u8] = &buf;
+                let before = input.len();
+                match p.feed(&mut input) {
+                    Ok(Some((Message::Data(_), _))) => {
+                        delivered += 1;
+                        let used = before - input.len();
+                        buf.drain(..used);
+                    }
+                    Ok(Some(_)) => unreachable!(),
+                    Ok(None) => {
+                        // Idle; blank lines may have been consumed, so advance past them.
+                        let used = before - input.len();
+                        buf.drain(..used);
+                        break;
+                    }
+                    Err(FeedError::Incomplete(_)) => {
+                        let used = before - input.len();
+                        buf.drain(..used);
+                        break;
+                    }
+                    Err(FeedError::Invalid(e)) => panic!("invalid: {e}"),
+                }
+            }
+        }
+        assert_eq!(delivered, 1);
+        assert!(buf.is_empty());
+        assert_eq!(p.stream_pos(), 2 + 44);
     }
 }
